@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
 
 import grpc
+from vosk import KaldiRecognizer, Model
 
 from voice_assistant.asr.partial import PartialTranscriptStabilizer
 from voice_assistant.asr.vad import VADConfig, VoiceActivityDetector
@@ -29,20 +31,7 @@ except Exception as exc:  # pragma: no cover - runtime setup
 class VoiceAssistantService(pb2_grpc.VoiceAssistantServicer):
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.bench = BenchmarkTracker()
-        self.vad = VoiceActivityDetector(
-            VADConfig(
-                sample_rate=settings.sample_rate,
-                frame_ms=settings.chunk_ms,
-                aggressiveness=settings.vad_aggressiveness,
-                mode="webrtc",
-            )
-        )
-
-        from vosk import KaldiRecognizer, Model
-
-        self._vosk = KaldiRecognizer(Model(settings.asr_model_path), settings.sample_rate)
-        self._partial = PartialTranscriptStabilizer()
+        self._vosk_model = Model(settings.asr_model_path)
 
         self.llm = StreamingLLMClient(
             LLMConfig(
@@ -51,41 +40,48 @@ class VoiceAssistantService(pb2_grpc.VoiceAssistantServicer):
                 n_gpu_layers=settings.n_gpu_layers,
                 max_tokens=settings.llm_max_tokens,
                 temperature=settings.llm_temperature,
-            ),
-            bench=self.bench,
+            )
         )
-        self.tts_queue = AudioChunkQueue(maxsize=settings.tts_queue_maxsize)
-        self.tts = PiperStreamingTTS(PiperConfig(settings.piper_voice_path), self.tts_queue, bench=self.bench)
 
     async def StreamVoice(
         self, request_iterator: AsyncIterator[pb2.AudioChunk], context: grpc.aio.ServicerContext
     ) -> AsyncIterator[pb2.AudioResponse]:
+        bench = BenchmarkTracker()
+        vad = self._build_vad()
+        recognizer = KaldiRecognizer(self._vosk_model, self.settings.sample_rate)
+        partial_stabilizer = PartialTranscriptStabilizer()
+        tts_queue = AudioChunkQueue(maxsize=self.settings.tts_queue_maxsize)
+        tts = PiperStreamingTTS(PiperConfig(self.settings.piper_voice_path), tts_queue, bench=bench)
+
         speech_buffer = bytearray()
-        token_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
 
         async for req in request_iterator:
             frame = req.pcm16
             if not frame:
                 continue
 
-            speech = self.vad.is_speech(frame[: self.vad.frame_bytes]) if len(frame) >= self.vad.frame_bytes else False
+            speech = vad.is_speech(frame[: vad.frame_bytes]) if len(frame) >= vad.frame_bytes else False
             if speech:
                 speech_buffer.extend(frame)
-                self._vosk.AcceptWaveform(frame)
-                partial = self._partial.update(self._extract_partial())
+                recognizer.AcceptWaveform(frame)
+                partial = partial_stabilizer.update(self._extract_partial(recognizer))
                 if partial:
                     logger.debug("partial=%s", partial)
                 continue
 
             if speech_buffer:
-                self._vosk.AcceptWaveform(bytes(speech_buffer))
-                text = self._extract_final()
+                recognizer.AcceptWaveform(bytes(speech_buffer))
+                text = self._extract_final(recognizer)
                 speech_buffer.clear()
                 if not text.strip():
+                    vad.reset()
+                    partial_stabilizer = PartialTranscriptStabilizer()
+                    tts_queue.clear()
                     continue
 
-                self.bench.mark("prompt_sent_ts")
-                _ = asyncio.create_task(self.llm.stream_tokens(text, token_queue))
+                bench.mark("prompt_sent_ts")
+                token_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+                _ = asyncio.create_task(self.llm.stream_tokens(text, token_queue, bench=bench))
 
                 tokens: list[str] = []
                 first_audio_sent = False
@@ -93,8 +89,8 @@ class VoiceAssistantService(pb2_grpc.VoiceAssistantServicer):
                     tok = await token_queue.get()
                     tokens.append(tok)
                     for sentence in sentence_chunks_from_tokens(tokens, max_tokens=self.settings.sentence_max_tokens):
-                        await self.tts.synthesize_sentence(sentence)
-                        chunk = await self.tts_queue.get()
+                        await tts.synthesize_sentence(sentence)
+                        chunk = await tts_queue.get()
                         if not first_audio_sent:
                             first_audio_sent = True
                         yield pb2.AudioResponse(
@@ -107,19 +103,30 @@ class VoiceAssistantService(pb2_grpc.VoiceAssistantServicer):
                     if tok.endswith("\n") or tok.endswith(".") or tok.endswith("?") or tok.endswith("!"):
                         break
 
-                logger.info("metrics=%s", self.bench.snapshot())
-                self.bench.reset()
+                logger.info("metrics=%s", bench.snapshot())
+                bench.reset()
+                vad.reset()
+                partial_stabilizer = PartialTranscriptStabilizer()
+                tts_queue.clear()
 
-    def _extract_partial(self) -> str:
-        import json
+    def _build_vad(self) -> VoiceActivityDetector:
+        return VoiceActivityDetector(
+            VADConfig(
+                sample_rate=self.settings.sample_rate,
+                frame_ms=self.settings.chunk_ms,
+                aggressiveness=self.settings.vad_aggressiveness,
+                mode="webrtc",
+            )
+        )
 
-        data = json.loads(self._vosk.PartialResult())
+    @staticmethod
+    def _extract_partial(recognizer: KaldiRecognizer) -> str:
+        data = json.loads(recognizer.PartialResult())
         return data.get("partial", "")
 
-    def _extract_final(self) -> str:
-        import json
-
-        data = json.loads(self._vosk.FinalResult())
+    @staticmethod
+    def _extract_final(recognizer: KaldiRecognizer) -> str:
+        data = json.loads(recognizer.FinalResult())
         return data.get("text", "")
 
 
